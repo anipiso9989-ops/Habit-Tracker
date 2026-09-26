@@ -15,7 +15,7 @@ A simple, local habit tracker built with Python, HTML, CSS, and vanilla JavaScri
 
 `app.py` runs a small HTTP server and exposes endpoints for managing habits. The frontend in `index.html` uses those endpoints to update the interface, while habit data is stored in `habits.json`.
 
-No external packages are required.
+No external packages are required. Make sure you have python installed on your device, though.
 
 ## Run
 
