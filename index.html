@@ -1,6 +1,8 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Habit Tracker</title>
 
     <style>
@@ -156,6 +158,14 @@
             font-size: 13px;
         }
 
+        .backup-panel { padding: 24px; border-bottom: 1px solid #444; }
+        .backup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+        .backup-panel p { color: #A3A3A3; line-height: 1.5; }
+        #storage-status { overflow-wrap: anywhere; }
+        #storage-status.error { color: #ffb4b4; }
+        #habit-name { min-width: 0; }
+        button:focus-visible { outline: 2px solid #FAFAFA; outline-offset: 3px; }
+
         @media (max-width: 640px) {
             .container {
                 width: calc(100% - 24px);
@@ -190,6 +200,7 @@
 
         <section class="add-panel">
             <input
+                aria-label="Habit name"
                 id="habit-name"
                 type="text"
                 placeholder="ENTER HABIT NAME"
@@ -200,188 +211,219 @@
             </button>
         </section>
 
-        <section id="habit-list"></section>
+        <section class="backup-panel" aria-label="JSON backups">
+            <div class="backup-actions">
+                <button id="import-button">[↑] IMPORT JSON</button>
+                <button id="export-button">[↓] EXPORT JSON</button>
+                <input id="import-file" type="file" accept=".json,application/json" hidden>
+            </div>
+            <p>Changes save in this browser. Export JSON to keep a permanent backup or move devices. Import replaces the current habits.</p>
+            <p id="storage-status" role="status" aria-live="polite"></p>
+        </section>
+        <section id="habit-list" aria-label="Habits"></section>
 
     </main>
 
     <script>
-        async function loadHabits() {
-            const response = await fetch("/habits");
-            const habits = await response.json();
+        "use strict";
+        const STORAGE_KEY = "habit-tracker-v1";
+        let habits = [];
+        let backupJSON = null;
+        let storageAvailable = true;
+        let loadBlocked = false;
+        const status = document.getElementById("storage-status");
 
-            const habitList = document.getElementById("habit-list");
-            habitList.innerHTML = "";
+        function dateKey(date = new Date()) {
+            return `${String(date.getFullYear()).padStart(4, "0")}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+        }
 
-            if (habits.length === 0) {
-                habitList.innerHTML = `
-                    <div class="empty-state">
-                        [--] NO HABITS CONFIGURED
-                    </div>
-                `;
-                return;
-            }
+        function validDate(value) {
+            if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+            const date = new Date(`${value}T12:00:00`);
+            return !Number.isNaN(date.getTime()) && dateKey(date) === value;
+        }
 
-            for (const habit of habits) {
-                const habitElement = document.createElement("div");
-                habitElement.className = "habit";
-
-                habitElement.innerHTML = `
-                    <div class="habit-info">
-                        <h2></h2>
-                        <p>${habit.streak} day streak</p>
-                    </div>
-
-                    <div class="habit-actions">
-                        <button class="complete-button">
-                            ${habit.completed_today ? "[-] UNDO" : "[+] COMPLETE"}
-                        </button>
-
-                        <button class="edit-button">
-                            [~] EDIT
-                        </button>
-
-                        <button class="delete-button">
-                            [X] DELETE
-                        </button>
-                    </div>
-                `;
-
-                habitElement.querySelector("h2").textContent = habit.name;
-
-                const completeButton =
-                    habitElement.querySelector(".complete-button");
-
-                if (habit.completed_today) {
-                    completeButton.classList.add("completed");
-                    completeButton.addEventListener("click", () => {
-                        undoHabit(habit.id);
-                    });
-                } else {
-                    completeButton.addEventListener("click", () => {
-                        completeHabit(habit.id);
-                    });
+        // Keep the Python app's JSON array format for existing backups.
+        function validateHabits(data) {
+            if (!Array.isArray(data)) throw new Error("Expected a JSON array of habits.");
+            const ids = new Set();
+            for (const habit of data) {
+                if (!habit || typeof habit !== "object" ||
+                    !Number.isSafeInteger(habit.id) || habit.id < 1 || ids.has(habit.id) ||
+                    typeof habit.name !== "string" || !habit.name.trim() ||
+                    !validDate(habit.created) || !Array.isArray(habit.completions) ||
+                    !habit.completions.every(validDate) ||
+                    new Set(habit.completions).size !== habit.completions.length) {
+                    throw new Error("Invalid habit: IDs must be unique positive integers, names nonempty, and dates real YYYY-MM-DD values without duplicate completions.");
                 }
+                ids.add(habit.id);
+            }
+            return data.map(habit => ({ id: habit.id, name: habit.name,
+                created: habit.created, completions: [...habit.completions] }));
+        }
 
-                habitElement
-                    .querySelector(".edit-button")
-                    .addEventListener("click", () => {
-                        editHabit(habit.id, habit.name);
-                    });
+        function showStatus(message, error = false) {
+            status.textContent = message;
+            status.classList.toggle("error", error);
+        }
 
-                habitElement
-                    .querySelector(".delete-button")
-                    .addEventListener("click", () => {
-                        deleteHabit(habit.id);
-                    });
+        function storageMessage() {
+            const needsBackup = JSON.stringify(habits) !== backupJSON;
+            showStatus((storageAvailable ? "Saved in this browser. " : "Browser storage unavailable; changes are only in memory. ") +
+                (needsBackup ? "Export JSON to back up these changes." : "Current data matches your last import/export."), !storageAvailable);
+        }
 
-                habitList.appendChild(habitElement);
+        function persist() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify({habits, backupJSON}));
+                storageAvailable = true;
+            } catch {
+                storageAvailable = false;
+            }
+            storageMessage();
+        }
+
+        function commit(nextHabits) {
+            if (loadBlocked) {
+                showStatus("Stored data could not be read. Import a valid backup to recover; existing storage has not been overwritten.", true);
+                return false;
+            }
+            habits = nextHabits;
+            persist();
+            render();
+            return true;
+        }
+
+        function calculateStreak(habit, today = new Date()) {
+            const completed = new Set(habit.completions);
+            const day = new Date(today.getTime());
+            day.setHours(12, 0, 0, 0);
+            if (!completed.has(dateKey(day))) day.setDate(day.getDate() - 1);
+            let streak = 0;
+            while (completed.has(dateKey(day))) {
+                streak++;
+                day.setDate(day.getDate() - 1);
+            }
+            return streak;
+        }
+
+        function render() {
+            const list = document.getElementById("habit-list");
+            list.replaceChildren();
+            if (!habits.length) {
+                const empty = document.createElement("div");
+                empty.className = "empty-state";
+                empty.textContent = "[--] NO HABITS CONFIGURED";
+                list.append(empty);
+            }
+            for (const habit of habits) {
+                const row = document.createElement("div");
+                row.className = "habit";
+                row.innerHTML = `<div class="habit-info"><h2></h2><p></p></div>
+                    <div class="habit-actions"><button class="complete-button"></button>
+                    <button class="edit-button">[~] EDIT</button><button class="delete-button">[X] DELETE</button></div>`;
+                row.querySelector("h2").textContent = habit.name;
+                row.querySelector("p").textContent = `${calculateStreak(habit)} day streak`;
+                const complete = row.querySelector(".complete-button");
+                const completed = habit.completions.includes(dateKey());
+                complete.textContent = completed ? "[-] UNDO" : "[+] COMPLETE";
+                complete.classList.toggle("completed", completed);
+                complete.addEventListener("click", () => {
+                    const today = dateKey();
+                    commit(habits.map(item => item.id !== habit.id ? item : {...item,
+                        completions: item.completions.includes(today)
+                            ? item.completions.filter(date => date !== today) : [...item.completions, today]}));
+                });
+                row.querySelector(".edit-button").addEventListener("click", () => {
+                    const name = prompt("Rename habit:", habit.name);
+                    if (name === null || !name.trim()) return;
+                    commit(habits.map(item => item.id === habit.id ? {...item, name: name.trim()} : item));
+                });
+                row.querySelector(".delete-button").addEventListener("click", () => {
+                    if (confirm("Delete this habit?")) commit(habits.filter(item => item.id !== habit.id));
+                });
+                list.append(row);
             }
         }
 
-
-        async function addHabit() {
+        function addHabit() {
             const input = document.getElementById("habit-name");
             const name = input.value.trim();
-
-            if (name === "") {
+            if (!name) return;
+            const id = habits.reduce((max, habit) => Math.max(max, habit.id), 0) + 1;
+            if (!Number.isSafeInteger(id)) {
+                showStatus("Cannot add a habit: the ID limit has been reached.", true);
                 return;
             }
+            if (commit([...habits, {id, name, created: dateKey(), completions: []}])) input.value = "";
+        }
 
-            const response = await fetch("/habits", {
-                method: "POST",
-
-                headers: {
-                    "Content-Type": "application/json"
-                },
-
-                body: JSON.stringify({
-                    name: name
-                })
-            });
-
-            if (response.ok) {
-                input.value = "";
-                await loadHabits();
+        async function importFile(event) {
+            const file = event.target.files[0];
+            event.target.value = "";
+            if (!file) return;
+            try {
+                const imported = validateHabits(JSON.parse(await file.text()));
+                if (!confirm(`Import ${imported.length} habit(s)? This replaces all current habits. Export first if you need to keep them.`)) return;
+                habits = imported;
+                backupJSON = JSON.stringify(habits);
+                loadBlocked = false;
+                persist();
+                render();
+            } catch (error) {
+                showStatus(`Import failed: ${error.message} Current habits were kept.`, true);
             }
         }
 
-        async function completeHabit(id) {
-            const response = await fetch(`/habits/${id}/complete`, {
-                method: "POST"
-            });
-
-            if (response.ok) {
-                await loadHabits();
-            }
-        }
-
-
-        async function undoHabit(id) {
-            const response = await fetch(`/habits/${id}/complete`, {
-                method: "DELETE"
-            });
-
-            if (response.ok) {
-                await loadHabits();
-            }
-        }
-
-        async function editHabit(id, currentName) {
-            const newName = prompt("Rename habit:", currentName);
-
-            if (newName === null || newName.trim() === "") {
+        function exportFile() {
+            if (loadBlocked) {
+                showStatus("Recover unreadable browser data with a valid import before exporting.", true);
                 return;
             }
-
-            const response = await fetch(`/habits/${id}`, {
-                method: "PUT",
-
-                headers: {
-                    "Content-Type": "application/json"
-                },
-
-                body: JSON.stringify({
-                    name: newName.trim()
-                })
-            });
-
-            if (response.ok) {
-                await loadHabits();
-            }
+            const blob = new Blob([JSON.stringify(habits, null, 2) + "\n"], {type: "application/json"});
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `habits-${dateKey()}.json`;
+            document.body.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            backupJSON = JSON.stringify(habits);
+            persist();
+            showStatus((storageAvailable ? "" : "Browser storage unavailable. ") +
+                "JSON download requested. Keep the downloaded file as your backup.", !storageAvailable);
         }
 
-        async function deleteHabit(id) {
-            const confirmed = confirm("Delete this habit?");
-
-            if (!confirmed) {
-                return;
-            }
-
-            const response = await fetch(`/habits/${id}`, {
-                method: "DELETE"
-            });
-
-            if (response.ok) {
-                await loadHabits();
-            }
-        }
-
-
-        document
-            .getElementById("add-button")
-            .addEventListener("click", addHabit);
-
-        document
-            .getElementById("habit-name")
-            .addEventListener("keydown", event => {
-                if (event.key === "Enter") {
-                    addHabit();
+        function initialize() {
+            let raw;
+            try { raw = localStorage.getItem(STORAGE_KEY); }
+            catch { storageAvailable = false; }
+            if (raw !== undefined && raw !== null) {
+                try {
+                    const saved = JSON.parse(raw);
+                    habits = validateHabits(saved.habits);
+                    backupJSON = typeof saved.backupJSON === "string" ? saved.backupJSON : null;
+                } catch {
+                    loadBlocked = true;
+                    showStatus("Stored data could not be read. Import a valid backup to recover; existing storage has not been overwritten.", true);
                 }
-            });
+            }
+            if (!loadBlocked) storageMessage();
+            render();
+        }
 
-
-        loadHabits();
+        document.getElementById("add-button").addEventListener("click", addHabit);
+        document.getElementById("habit-name").addEventListener("keydown", event => {
+            if (event.key === "Enter") addHabit();
+        });
+        document.getElementById("import-button").addEventListener("click", () => document.getElementById("import-file").click());
+        document.getElementById("import-file").addEventListener("change", importFile);
+        document.getElementById("export-button").addEventListener("click", exportFile);
+        // Recompute today's completion and streak when returning or crossing midnight.
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
+        setInterval(render, 60000);
+        initialize();
     </script>
-
 </body>
 </html>
